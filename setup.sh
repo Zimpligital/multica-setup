@@ -6,6 +6,7 @@
 #   ./setup.sh https://multica.example.com --repo=https://git.example.com/team/app.git --git-token
 #                                                                  # + download a repo and install what it needs
 #   ./setup.sh https://multica.example.com --cli                   # macOS: also install the CLI (terminal only, no 2nd daemon)
+#   ./setup.sh https://multica.example.com --docker                # + Docker for local containers (databases etc.)
 #
 # Options:
 #   --repo=<git url>          Repo to download: https://… or SSH (git@host:org/repo.git). Its own files decide
@@ -21,6 +22,10 @@
 #   --dir=<path>              Where to put the repo (default: ~/Projects/<repo name>)
 #   --min-ram=<GB>            Warn below this much memory (default: 8)
 #   --min-disk=<GB>           Stop below this much free disk (default: 5)
+#   --docker[=<runtime>]      Make sure Docker (with compose) is installed and running. Runtimes on macOS:
+#                             desktop (Docker Desktop, default), orbstack, colima (needs Homebrew). An engine that
+#                             is already installed is used as is. Without this flag Docker is only set up when the
+#                             downloaded repo has a compose file (asked first), and --no-docker skips it.
 #   --check                   Report what is missing or outdated; install nothing
 #
 # From a URL:
@@ -33,14 +38,18 @@
 set -euo pipefail
 
 # ---------------- args ----------------
-SERVER_URL=""; WANT_CLI=0; CHECK=0
+SERVER_URL=""; WANT_CLI=0; CHECK=0; WANT_DOCKER=auto; DOCKER_RUNTIME=desktop
 REPO_URL=""; REPO_NAME=""; REPO_SSH=0; NEEDS_GH=0; BRANCH=""; REPO_DIR=""; GIT_USER=token; ASK_TOKEN=0; GIT_TOKEN="${SETUP_GIT_TOKEN:-}"
 RAM_MIN_GB=8; DISK_MIN_GB=5
-usage() { echo "Usage: setup.sh https://your-multica-server [--repo=URL [--git-token[=TOKEN]] [--git-user=NAME] [--branch=NAME] [--dir=PATH]] [--min-ram=GB] [--min-disk=GB] [--check] [--cli]"; }
+usage() { echo "Usage: setup.sh https://your-multica-server [--repo=URL [--git-token[=TOKEN]] [--git-user=NAME] [--branch=NAME] [--dir=PATH]] [--min-ram=GB] [--min-disk=GB] [--docker[=desktop|orbstack|colima]|--no-docker] [--check] [--cli]"; }
 for arg in "$@"; do
   case "$arg" in
     --cli) WANT_CLI=1 ;;
     --check) CHECK=1 ;;
+    --docker) WANT_DOCKER=yes ;;
+    --docker=desktop|--docker=orbstack|--docker=colima) WANT_DOCKER=yes; DOCKER_RUNTIME="${arg#*=}" ;;
+    --docker=*) echo "Unknown Docker runtime: ${arg#*=} (use desktop, orbstack or colima)"; exit 1 ;;
+    --no-docker) WANT_DOCKER=no ;;
     --repo=*) REPO_URL="${arg#*=}" ;;
     --git-token) ASK_TOKEN=1 ;;
     --git-token=*) GIT_TOKEN="${arg#*=}" ;;
@@ -515,6 +524,103 @@ if [ -n "$REPO_URL" ]; then
       (cd "$REPO_DIR" && "$PM" install >"$LOG" 2>&1) || fail "$PM install failed — see $LOG"
       rm -f "$LOG"; ok "Installed"
     fi
+  fi
+fi
+
+# ---------------- Docker (local containers) ----------------
+compose_in_repo() { # the downloaded repo runs containers locally
+  local f
+  [ -n "${REPO_DIR:-}" ] && [ -d "$REPO_DIR" ] || return 1
+  for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml compose.local.yml docker/compose.local.yml docker/compose.yaml; do
+    [ -f "$REPO_DIR/$f" ] && return 0
+  done
+  return 1
+}
+docker_running() { have docker && docker info >/dev/null 2>&1; }
+docker_start_known() { # start an installed engine on macOS (no admin needed)
+  if [ -d /Applications/Docker.app ] || [ -d "$HOME/Applications/Docker.app" ]; then open -a Docker
+  elif [ -d /Applications/OrbStack.app ] || have orb; then open -a OrbStack 2>/dev/null || orb start >/dev/null 2>&1
+  elif have colima; then colima start >/dev/null 2>&1
+  else return 1; fi
+}
+docker_wait() { # up to ~3 min: first starts unpack images and may ask for approval in a window
+  local i; for i in $(seq 1 90); do docker_running && return 0; sleep 2; done; return 1
+}
+install_dmg_app() { # install_dmg_app <url> <App name>
+  local url="$1" app="$2" tmp dest
+  tmp="$(mktemp -d)"
+  echo "Downloading $app…"
+  curl -fL --progress-bar -o "$tmp/app.dmg" "$url" || { rm -rf "$tmp"; return 1; }
+  hdiutil attach -nobrowse -quiet -mountpoint "$tmp/mnt" "$tmp/app.dmg" || { rm -rf "$tmp"; return 1; }
+  dest=/Applications
+  if [ -w "$dest" ]; then rm -rf "$dest/$app.app"; cp -R "$tmp/mnt/$app.app" "$dest/"
+  else
+    echo "Copying $app to /Applications needs your Mac password."
+    sudo rm -rf "$dest/$app.app" < "$TTY" && sudo cp -R "$tmp/mnt/$app.app" "$dest/" < "$TTY"
+  fi
+  hdiutil detach -quiet "$tmp/mnt" || true; rm -rf "$tmp"
+  [ -d "$dest/$app.app" ]
+}
+
+DOCKER_NEEDED=0
+case "$WANT_DOCKER" in
+  yes) DOCKER_NEEDED=1 ;;
+  auto)
+    if compose_in_repo; then
+      if docker_running; then DOCKER_NEEDED=1
+      elif [ "$CHECK" = 1 ]; then DOCKER_NEEDED=1
+      elif ask "This project runs a local database in Docker. Set up Docker now? [y/N] "; then DOCKER_NEEDED=1
+      else warn "Skipped Docker — the apps run, but not the local database. Rerun with --docker later."; fi
+    fi ;;
+esac
+
+if [ "$DOCKER_NEEDED" = 1 ]; then
+  step "Docker"
+  if docker_running; then
+    ok "Docker is running ($(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'))"
+  elif [ "$CHECK" = 1 ]; then
+    if have docker; then need "Docker is installed but not running — will start it"
+    else need "Docker is not installed — will install ${DOCKER_RUNTIME}"; fi
+  elif [ "$OS" = linux ]; then
+    if have docker; then
+      id -nG | grep -qw docker || need "Add yourself to the docker group: sudo usermod -aG docker $USER (then log out and in)"
+      need "Docker is installed but not running — start it: sudo systemctl enable --now docker"
+    else
+      need "Install Docker Engine for your distribution: https://docs.docker.com/engine/install/ (then rerun this script)"
+    fi
+  else
+    if ! docker_start_known; then
+      ARCH_D="$(uname -m)"
+      case "$DOCKER_RUNTIME" in
+        desktop)
+          [ "$ARCH_D" = arm64 ] && d_arch=arm64 || d_arch=amd64
+          install_dmg_app "https://desktop.docker.com/mac/main/$d_arch/Docker.dmg" Docker || fail "Docker Desktop install failed — install it from https://www.docker.com/products/docker-desktop/ and rerun"
+          ok "Installed Docker Desktop"
+          echo "   Docker Desktop opens: accept the terms, allow the helper (your Mac password), you can skip sign-in."
+          open -a Docker ;;
+        orbstack)
+          [ "$ARCH_D" = arm64 ] && o_arch=arm64 || o_arch=amd64
+          install_dmg_app "https://orbstack.dev/download/stable/latest/$o_arch" OrbStack || fail "OrbStack install failed — install it from https://orbstack.dev and rerun"
+          ok "Installed OrbStack"
+          echo "   OrbStack opens: finish its short welcome steps (choose Docker)."
+          open -a OrbStack ;;
+        colima)
+          have brew || fail "Colima needs Homebrew (https://brew.sh). Install Homebrew, or rerun with --docker=desktop"
+          brew install colima docker docker-compose >/dev/null || fail "brew install colima docker docker-compose failed"
+          mkdir -p "$HOME/.docker/cli-plugins"
+          ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" "$HOME/.docker/cli-plugins/docker-compose"
+          ok "Installed Colima"
+          colima start --cpu 2 --memory 4 >/dev/null 2>&1 || true ;;
+      esac
+      hash -r
+    fi
+    echo "Waiting for Docker to start (the first time can take a few minutes)…"
+    if docker_wait; then ok "Docker is running ($(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'))"
+    else need "Docker did not start yet — open the Docker app, finish any steps it shows, then rerun this script"; fi
+  fi
+  if docker_running; then
+    docker compose version >/dev/null 2>&1 && ok "docker compose $(docker compose version --short 2>/dev/null)" \
+      || need "docker compose is missing — reinstall Docker, or rerun with --docker=desktop"
   fi
 fi
 
