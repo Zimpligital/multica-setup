@@ -8,11 +8,14 @@
 #   ./setup.sh https://multica.example.com --cli                   # macOS: also install the CLI (terminal only, no 2nd daemon)
 #
 # Options:
-#   --repo=<https git url>    Repo to download. Its own files decide what else is installed:
+#   --repo=<git url>          Repo to download: https://… or SSH (git@host:org/repo.git). Its own files decide
+#                             what else is installed:
 #                             package.json "packageManager" / "engines" (bun, pnpm, yarn, npm) or its lockfile.
 #   --git-token[=<token>]     Access token for --repo (for people without an account on the main git host).
 #                             Without a value it is asked hidden, which keeps it out of shell history.
 #                             Also read from $SETUP_GIT_TOKEN. Not needed if git can already reach the repo.
+#                             github.com over https without a token: signs in with GitHub CLI in the browser
+#                             (works with org SSO); the CLI is installed to ~/.local/bin if missing.
 #   --git-user=<name>         Username sent with the token (default: token; some servers need your user name)
 #   --branch=<name>           Branch to download (default: the repo's default branch)
 #   --dir=<path>              Where to put the repo (default: ~/Projects/<repo name>)
@@ -31,7 +34,7 @@ set -euo pipefail
 
 # ---------------- args ----------------
 SERVER_URL=""; WANT_CLI=0; CHECK=0
-REPO_URL=""; REPO_NAME=""; BRANCH=""; REPO_DIR=""; GIT_USER=token; ASK_TOKEN=0; GIT_TOKEN="${SETUP_GIT_TOKEN:-}"
+REPO_URL=""; REPO_NAME=""; REPO_SSH=0; NEEDS_GH=0; BRANCH=""; REPO_DIR=""; GIT_USER=token; ASK_TOKEN=0; GIT_TOKEN="${SETUP_GIT_TOKEN:-}"
 RAM_MIN_GB=8; DISK_MIN_GB=5
 usage() { echo "Usage: setup.sh https://your-multica-server [--repo=URL [--git-token[=TOKEN]] [--git-user=NAME] [--branch=NAME] [--dir=PATH]] [--min-ram=GB] [--min-disk=GB] [--check] [--cli]"; }
 for arg in "$@"; do
@@ -55,8 +58,15 @@ done
 SERVER_HOST="$(printf '%s' "$SERVER_URL" | sed -E 's#^https?://##; s#/.*$##')"
 DESKTOP_PROFILE="desktop-${SERVER_HOST//:/-}"
 if [ -n "$REPO_URL" ]; then
-  [[ "$REPO_URL" == https://* ]] || { echo "--repo must be an https:// URL"; exit 1; }
+  case "$REPO_URL" in
+    https://*) REPO_SSH=0 ;;
+    ssh://*|*@*:*) REPO_SSH=1 ;;
+    *) echo "--repo must be an https:// or SSH (git@host:org/repo.git) URL"; exit 1 ;;
+  esac
   REPO_URL="${REPO_URL%/}"
+  if [ "$REPO_SSH" = 1 ] && { [ "$ASK_TOKEN" = 1 ] || [ -n "$GIT_TOKEN" ]; }; then
+    echo "--git-token only works with an https:// --repo (SSH uses your SSH key)"; exit 1
+  fi
   REPO_NAME="$(basename "$REPO_URL" .git)"
   [ -n "$REPO_DIR" ] || REPO_DIR="$HOME/Projects/$REPO_NAME"
   case "$REPO_DIR" in "~"/*) REPO_DIR="$HOME/${REPO_DIR#\~/}" ;; esac
@@ -125,7 +135,10 @@ ok "$SERVER_URL is reachable"
 ensure_path "$LOCAL_BIN"
 ensure_path "$HOME/.bun/bin"
 
-if [ -n "$REPO_URL" ]; then
+if [ -n "$REPO_URL" ] && [ "$REPO_SSH" = 1 ]; then
+  step "Access to $REPO_URL"
+  ok "SSH address — your SSH key is used when downloading"
+elif [ -n "$REPO_URL" ]; then
   step "Access to $REPO_URL"
   if [ "$ASK_TOKEN" = 1 ] && [ -z "$GIT_TOKEN" ]; then
     printf "Paste your git access token (input is hidden): "
@@ -143,6 +156,7 @@ if [ -n "$REPO_URL" ]; then
     200) ok "Repo is reachable${GIT_TOKEN:+ with your token}" ;;
     401|403|404)
       if [ -n "$GIT_TOKEN" ]; then fail "Token rejected for $REPO_URL (HTTP $code) — wrong, expired or no access. Ask your admin."
+      elif [[ "$REPO_URL" == https://github.com/* ]]; then NEEDS_GH=1; ok "Private GitHub repo — you sign in with GitHub in the browser below"
       else warn "Repo needs a login (HTTP $code) — using your existing git login; add --git-token if you have none"; fi ;;
     000) fail "Cannot reach $REPO_URL" ;;
     *) warn "Unexpected answer $code from $REPO_URL — trying anyway" ;;
@@ -409,7 +423,40 @@ ensure_node_pm() {  # ensure_node_pm <npm|pnpm|yarn> <version or empty>
   ok "$pm $("$pm" --version 2>/dev/null)"
 }
 
+ensure_gh() {  # GitHub CLI in ~/.local/bin (no admin)
+  have gh && return 0
+  [ "$CHECK" = 1 ] && return 1
+  local tag ver os arch ext tmp
+  tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/cli/cli/releases/latest | sed -n 's#.*/tag/##p')"
+  ver="${tag#v}"; [ -n "$ver" ] || return 1
+  case "$OS" in mac) os=macOS; ext=zip ;; *) os=linux; ext=tar.gz ;; esac
+  case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) return 1 ;; esac
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/gh.$ext" "https://github.com/cli/cli/releases/download/$tag/gh_${ver}_${os}_${arch}.$ext" || { rm -rf "$tmp"; return 1; }
+  if [ "$ext" = zip ]; then unzip -q "$tmp/gh.zip" -d "$tmp"; else tar -xzf "$tmp/gh.tar.gz" -C "$tmp"; fi
+  install -m 0755 "$tmp/gh_${ver}_${os}_${arch}/bin/gh" "$LOCAL_BIN/gh"; rm -rf "$tmp"; hash -r; have gh
+}
+github_login() {  # browser sign-in; git then uses it for github.com (overrides old saved passwords)
+  step "GitHub sign-in"
+  if have gh && gh auth status --hostname github.com </dev/null >/dev/null 2>&1; then
+    ok "Signed in to GitHub as $(gh api user --jq .login </dev/null 2>/dev/null || echo '?')"
+  elif [ "$CHECK" = 1 ]; then
+    need "Not signed in to GitHub — will open the browser to sign in (GitHub CLI)"; return 0
+  else
+    ensure_gh || fail "Could not install GitHub CLI — install it from https://cli.github.com and rerun"
+    echo "A browser window opens: sign in to GitHub and approve. If your organization uses SSO, also click Authorize for it."
+    gh auth login --hostname github.com --git-protocol https --web < "$TTY" || fail "GitHub sign-in did not finish — rerun this script"
+    ok "Signed in to GitHub as $(gh api user --jq .login </dev/null 2>/dev/null || echo '?')"
+  fi
+  if [ "$CHECK" = 0 ]; then
+    gh auth setup-git --hostname github.com </dev/null >/dev/null 2>&1 && ok "git uses this GitHub sign-in" \
+      || warn "Could not connect git to the GitHub sign-in — run: gh auth setup-git"
+  fi
+  return 0
+}
+
 if [ -n "$REPO_URL" ]; then
+  [ "$NEEDS_GH" = 1 ] && github_login
   step "Repo \"$REPO_NAME\" → $REPO_DIR"
   AUTH_URL="$REPO_URL"; [ -n "$GIT_TOKEN" ] && AUTH_URL="https://$GIT_USER:$GIT_TOKEN@${REPO_URL#https://}"
   if [ -d "$REPO_DIR/.git" ]; then
@@ -429,7 +476,9 @@ if [ -n "$REPO_URL" ]; then
     mkdir -p "$(dirname "$REPO_DIR")"
     if [ -n "$BRANCH" ]; then git clone --quiet --branch "$BRANCH" "$AUTH_URL" "$REPO_DIR"
     else git clone --quiet "$AUTH_URL" "$REPO_DIR"; fi \
-      || fail "Download failed — check the URL${BRANCH:+, branch $BRANCH} and your access"
+      || fail "Download failed — check the URL${BRANCH:+, branch $BRANCH} and your access$(
+           [ "$REPO_SSH" = 1 ] && echo ". SSH: add your key to the git host (and authorize it for org SSO if used)."
+           [ "$NEEDS_GH" = 1 ] && echo ". GitHub: make sure you are in the organization and authorized SSO for your sign-in (github.com → Settings → Applications).")"
     ok "Downloaded $(git -C "$REPO_DIR" branch --show-current)"
   fi
   # The token lives in .git/config: only this user may read it
