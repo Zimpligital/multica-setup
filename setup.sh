@@ -214,9 +214,17 @@ if have claude; then
   elif [ "$CHECK" = 1 ]; then need "Claude is not logged in"
   else
     warn "Claude is not logged in."
-    echo "   A browser window opens: sign in with your work account and approve."
-    pause "Press Enter to sign in… "
-    claude auth login < "$TTY" || { echo "   If no browser opened: run claude, type /login, finish in the browser, then type /exit"; claude < "$TTY" || true; }
+    # Claude Code crashes on macOS when its input is redirected from /dev/tty (kqueue EINVAL),
+    # so only start the sign-in when this script already reads from the terminal.
+    if [ -t 0 ]; then
+      echo "   A browser window opens: sign in with your work account and approve."
+      pause "Press Enter to sign in… "
+      claude auth login || true
+    else
+      echo "   Open a NEW Terminal window and run:  claude auth login"
+      echo "   Sign in with your work account in the browser, then come back here."
+      pause "Press Enter when you have signed in… "
+    fi
     if claude_ok; then ok "Claude is logged in$( w="$(claude_who)"; [ -n "$w" ] && echo " as $w")"
     else
       warn "Claude still looks logged out. If you just signed in, open a new Terminal window and run: claude auth status"
