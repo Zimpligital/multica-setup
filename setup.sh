@@ -201,15 +201,27 @@ fi
 
 if have claude; then
   step "Claude login (your own subscription)"
-  claude_ok() { claude -p "Reply with OK only" --max-turns 1 </dev/null >/dev/null 2>&1; }
-  if claude_ok; then ok "Claude is logged in"
+  # `claude auth status` reads the saved login (no request to Claude, so no false alarms from
+  # network or usage limits). Older Claude Code without it: fall back to a one-line test request.
+  claude_status() { claude auth status --json </dev/null 2>/dev/null; }
+  claude_ok() {
+    local st; st="$(claude_status)"
+    if [ -n "$st" ]; then printf '%s' "$st" | tr -d ' \n' | grep -q '"loggedIn":true'
+    else claude -p "Reply with OK only" --max-turns 1 </dev/null >/dev/null 2>&1; fi
+  }
+  claude_who() { claude_status | tr -d '\n' | sed -nE 's/.*"email"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p'; }
+  if claude_ok; then ok "Claude is logged in$( w="$(claude_who)"; [ -n "$w" ] && echo " as $w")"
   elif [ "$CHECK" = 1 ]; then need "Claude is not logged in"
   else
     warn "Claude is not logged in."
-    echo "   In Claude: type /login, finish sign-in in the browser, then type /exit"
-    pause "Press Enter to open Claude… "
-    claude < "$TTY" || true
-    claude_ok && ok "Claude is logged in" || fail "Claude still not logged in — rerun this script after /login"
+    echo "   A browser window opens: sign in with your work account and approve."
+    pause "Press Enter to sign in… "
+    claude auth login < "$TTY" || { echo "   If no browser opened: run claude, type /login, finish in the browser, then type /exit"; claude < "$TTY" || true; }
+    if claude_ok; then ok "Claude is logged in$( w="$(claude_who)"; [ -n "$w" ] && echo " as $w")"
+    else
+      warn "Claude still looks logged out. If you just signed in, open a new Terminal window and run: claude auth status"
+      need "Claude login could not be confirmed — run the same command again after signing in"
+    fi
   fi
 fi
 
