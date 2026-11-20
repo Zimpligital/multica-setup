@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Multica member setup — macOS / Linux   (Windows: use setup.ps1)
 #
-#   ./setup.sh https://multica.example.com                         # Claude Code, Multica, git
+#   ./setup.sh https://multica.example.com                         # Claude Code, Multica
 #   ./setup.sh https://multica.example.com --check                 # only check and report, change nothing
 #   ./setup.sh https://multica.example.com --repo=https://git.example.com/team/app.git --git-token
-#                                                                  # + download a repo and install what it needs
+#                                                                  # + git, download a repo and install what it needs
 #   ./setup.sh https://multica.example.com --cli                   # macOS: also install the CLI (terminal only, no 2nd daemon)
 #   ./setup.sh https://multica.example.com --docker                # + Docker for local containers (databases etc.)
 #
@@ -233,9 +233,12 @@ if have claude; then
   fi
 fi
 
-# ---------------- git (Apple Command Line Tools) ----------------
+# ---------------- git (Apple Command Line Tools) — only needed with --repo ----------------
 step "git"
-if [ "$OS" = mac ]; then
+if [ -z "$REPO_URL" ]; then
+  if have git && { [ "$OS" != mac ] || xcode-select -p >/dev/null 2>&1; }; then ok "$(git --version)"
+  else ok "Not installed — skipped (only needed with --repo)"; fi
+elif [ "$OS" = mac ]; then
   if xcode-select -p >/dev/null 2>&1; then ok "Command Line Tools installed ($(git --version))"
   elif [ "$CHECK" = 1 ]; then need "Apple Command Line Tools (git) are not installed"
   else
