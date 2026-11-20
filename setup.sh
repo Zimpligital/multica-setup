@@ -356,7 +356,7 @@ if [ "$MODE" = app ]; then
     osascript -e 'quit app "Multica"' >/dev/null 2>&1 || true
     ARCH="$(uname -m)"; [ "$ARCH" = x86_64 ] && ARCH=x64
     DMG_URL="https://github.com/multica-ai/multica/releases/download/v$LATEST/multica-desktop-$LATEST-mac-$ARCH.dmg"
-    TMP="$(mktemp -d)"; echo "Downloading Multica Desktop $LATEST…"
+    TMP="$(mktemp -d)"; echo "Downloading Multica Desktop ${LATEST}…"
     if [ -n "$LATEST" ] && curl -fL --progress-bar -o "$TMP/m.dmg" "$DMG_URL"; then
       hdiutil attach -nobrowse -quiet -mountpoint "$TMP/mnt" "$TMP/m.dmg"
       DEST=/Applications; [ -w "$DEST" ] || DEST="$HOME/Applications"; mkdir -p "$DEST"
@@ -572,7 +572,7 @@ docker_wait() { # up to ~3 min: first starts unpack images and may ask for appro
 install_dmg_app() { # install_dmg_app <url> <App name>
   local url="$1" app="$2" tmp dest
   tmp="$(mktemp -d)"
-  echo "Downloading $app…"
+  echo "Downloading ${app}…"
   curl -fL --progress-bar -o "$tmp/app.dmg" "$url" || { rm -rf "$tmp"; return 1; }
   hdiutil attach -nobrowse -quiet -mountpoint "$tmp/mnt" "$tmp/app.dmg" || { rm -rf "$tmp"; return 1; }
   dest=/Applications
